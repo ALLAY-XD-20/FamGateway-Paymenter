@@ -1,143 +1,193 @@
 <?php
 
-namespace Paymenter\Extensions\Gateways\FamGateway\Includes;
+namespace Paymenter\Extensions\Gateways\FamGateway;
 
-/**
- * FamGateway PHP SDK (ported from the official famgateway-sdk)
- * Renamed to FamGatewayClient inside this extension to avoid clashing
- * with the Paymenter extension class, which is also named FamGateway.
- */
-class FamGatewayClient
+use Illuminate\Http\Request;
+use App\Helpers\ExtensionHelper;
+use App\Classes\Extension\Gateway;
+use Illuminate\Support\Facades\View;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
+use Paymenter\Extensions\Gateways\FamGateway\Includes\FamGatewayClient;
+
+// How long a generated FamGateway order is tracked for the "return from
+// checkout" fallback verification below. After this, verifyPaymentStatus()
+// will no longer be able to look up the order_id for that invoice — it
+// does NOT affect the webhook, which keeps working for late arrivals.
+const FAMGATEWAY_ORDER_TTL_SECONDS = 3600; // 1 hour
+
+class FamGateway extends Gateway
 {
-    private $apiKey;
-    private $baseUrl = 'https://famgateway.in';
-
-    public function __construct($apiKey)
+    public function boot()
     {
-        if (empty($apiKey) || !is_string($apiKey)) {
-            throw new \InvalidArgumentException('A valid FamGateway API Key string is required.');
-        }
-        $this->apiKey = trim($apiKey);
+        require __DIR__ . '/routes/web.php';
+        View::addNamespace('extensions.gateways.famgateway', __DIR__ . '/views');
     }
 
-    /**
-     * Internal HTTP GET request helper with robust cURL support and stream fallback.
-     * Works seamlessly even on shared hosting where allow_url_fopen is disabled.
-     */
-    private function makeRequest($url)
+    public function getConfig($values = [])
     {
-        if (function_exists('curl_init')) {
-            $ch = curl_init($url);
-            curl_setopt_array($ch, [
-                CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_TIMEOUT => 15,
-                CURLOPT_SSL_VERIFYPEER => true,
-                CURLOPT_USERAGENT => 'FamGateway-PHP-SDK/2.0',
-                CURLOPT_HTTPHEADER => ['Accept: application/json'],
-            ]);
-            $response = curl_exec($ch);
-            curl_close($ch);
-            if ($response !== false) {
-                return $response;
-            }
-        }
-
-        // Fallback to file_get_contents if cURL is not available
-        $ctx = stream_context_create([
-            'http' => [
-                'timeout' => 15,
-                'header' => "User-Agent: FamGateway-PHP-SDK/2.0\r\nAccept: application/json\r\n",
+        return [
+            [
+                'name' => 'api_key',
+                'label' => 'API Key',
+                'description' => 'Your FamGateway Secret API Key (sk_live_...) from https://famgateway.in/dashboard.php',
+                'type' => 'text',
+                'required' => true,
             ],
-        ]);
-        $response = @file_get_contents($url, false, $ctx);
-        if ($response === false) {
-            throw new \Exception('FamGateway Error: Failed to connect to API server.');
-        }
-        return $response;
-    }
-
-    /**
-     * Create an order and return raw API response data without redirecting.
-     * Used by the extension so it can render its own checkout/redirect view.
-     *
-     * @param float|int|string $amount The amount to charge (e.g., 499.00)
-     * @param array $params Optional: ['redirect_url' => '', 'webhook_url' => '', 'customer_name' => '', 'customer_email' => '', 'customer_phone' => '']
-     * @return array Order data including order_id, checkout_url, qr_url, upi_intent
-     * @throws \Exception On API or network error
-     */
-    public function createOrder($amount, $params = [])
-    {
-        $query = [
-            'api_key' => $this->apiKey,
-            'amount' => (string) $amount,
         ];
-        if (!empty($params['redirect_url'])) {
-            $query['redirect_url'] = $params['redirect_url'];
-        }
-        if (!empty($params['webhook_url'])) {
-            $query['webhook_url'] = $params['webhook_url'];
-        }
-        if (!empty($params['customer_name'])) {
-            $query['customer_name'] = $params['customer_name'];
-        }
-        if (!empty($params['customer_email'])) {
-            $query['customer_email'] = $params['customer_email'];
-        }
-        if (!empty($params['customer_phone'])) {
-            $query['customer_phone'] = $params['customer_phone'];
+    }
+
+    public function pay($invoice, $total)
+    {
+        if ($invoice->currency_code !== 'INR') {
+            return view('extensions.gateways.famgateway::error', [
+                'error' => 'The product currency code must be "INR" to make payments with FamGateway!',
+            ]);
         }
 
-        $url = $this->baseUrl . '/api/qr.php?' . http_build_query($query);
-        $response = $this->makeRequest($url);
+        $apiKey = $this->config('api_key');
+        $client = new FamGatewayClient($apiKey);
 
-        $data = json_decode($response, true);
-        if (isset($data['status']) && $data['status'] === 'success') {
-            return $data['data'];
+        $redirectUrl = route('extensions.gateways.famgateway.callback', ['invoiceId' => $invoice->id]);
+        $webhookUrl = route('extensions.gateways.famgateway.webhook', ['invoiceId' => $invoice->id]);
+
+        $params = [
+            'redirect_url' => $redirectUrl,
+            'webhook_url' => $webhookUrl,
+        ];
+
+        // Best-effort customer details; skipped silently if not available on the invoice model
+        try {
+            if (!empty($invoice->user)) {
+                if (!empty($invoice->user->name)) {
+                    $params['customer_name'] = $invoice->user->name;
+                }
+                if (!empty($invoice->user->email)) {
+                    $params['customer_email'] = $invoice->user->email;
+                }
+            }
+        } catch (\Exception $e) {
+            // Ignore, customer details are optional
         }
-        throw new \Exception('FamGateway Error: ' . ($data['message'] ?? 'Unknown API error'));
+
+        try {
+            $order = $client->createOrder($total, $params);
+
+            // Remember which FamGateway order_id belongs to this invoice, for
+            // 1 hour, so that when the customer is redirected back we can
+            // actively re-check payment status instead of relying solely on
+            // the webhook (webhooks can be delayed, dropped, or blocked by a
+            // firewall — that mismatch is what causes "payment successful
+            // but status not updated").
+            if (!empty($order['order_id'])) {
+                Cache::put(
+                    'famgateway_order:' . $invoice->id,
+                    $order['order_id'],
+                    now()->addSeconds(FAMGATEWAY_ORDER_TTL_SECONDS)
+                );
+            }
+
+            return view('extensions.gateways.famgateway::pay', [
+                'checkoutUrl' => $order['checkout_url'] ?? null,
+                'qrUrl' => $order['qr_url'] ?? null,
+                'upiIntent' => $order['upi_intent'] ?? null,
+                'orderId' => $order['order_id'] ?? null,
+                'invoiceId' => $invoice->id,
+            ]);
+        } catch (\Exception $e) {
+            return view('extensions.gateways.famgateway::error', [
+                'error' => 'Failed to create order: ' . $e->getMessage(),
+            ]);
+        }
+    }
+
+    public function webhook(Request $request, $invoiceId)
+    {
+        $content = $request->getContent();
+        $signature = $request->header('X-FamGateway-Signature');
+        $apiKey = $this->config('api_key');
+
+        $client = new FamGatewayClient($apiKey);
+        $data = $client->verifyWebhook($content, $signature);
+
+        if ($data === false) {
+            return response('Signature verification failed', 401);
+        }
+
+        $event = $data['event'] ?? ($data['status'] ?? null);
+        $amount = $data['amount'] ?? null;
+        $transactionId = $data['transaction_id'] ?? ($data['utr'] ?? null);
+
+        if ($event === 'payment.success' || $event === 'success') {
+            if (!$this->invoiceAlreadyPaid($invoiceId)) {
+                ExtensionHelper::addPayment($invoiceId, 'FamGateway', $amount, null, $transactionId);
+            }
+            // Whether the webhook or the redirect fallback got there first,
+            // the order is settled — no need to verify it again later.
+            Cache::forget('famgateway_order:' . $invoiceId);
+        }
+
+        return response('Webhook received and processed successfully');
     }
 
     /**
-     * Check order status from FamGateway server.
-     *
-     * @param string $orderId The order ID (e.g. fg_A1B2C3D4)
-     * @return array Status array containing status, order_id, amount, utr, etc.
-     * @throws \Exception On API or network error
+     * Called from the callback route when the customer is redirected back
+     * from FamGateway's hosted checkout. This is a fallback safety net for
+     * when the webhook hasn't arrived yet (or never arrives): it actively
+     * asks FamGateway for the order's real status and marks the invoice
+     * paid if needed, instead of just trusting that the webhook already did.
      */
-    public function getOrderStatus($orderId)
+    public function verifyPaymentStatus($invoiceId)
     {
+        if ($this->invoiceAlreadyPaid($invoiceId)) {
+            return;
+        }
+
+        $orderId = Cache::get('famgateway_order:' . $invoiceId);
         if (empty($orderId)) {
-            throw new \InvalidArgumentException('Order ID is required to fetch status.');
+            // Either the order is older than the 1 hour tracking window, or
+            // pay() was never reached for this invoice. Nothing to verify.
+            return;
         }
-        $query = [
-            'api_key' => $this->apiKey,
-            'order_id' => trim($orderId),
-        ];
-        $url = $this->baseUrl . '/api/verify-order.php?' . http_build_query($query);
-        $response = $this->makeRequest($url);
-        return json_decode($response, true);
+
+        $apiKey = $this->config('api_key');
+
+        try {
+            $client = new FamGatewayClient($apiKey);
+            $status = $client->getOrderStatus($orderId);
+        } catch (\Exception $e) {
+            Log::warning('FamGateway: status check failed for invoice ' . $invoiceId . ': ' . $e->getMessage());
+            return;
+        }
+
+        $state = strtolower($status['status'] ?? '');
+
+        if (in_array($state, ['success', 'paid', 'completed'], true)) {
+            $amount = $status['amount'] ?? null;
+            $transactionId = $status['transaction_id'] ?? ($status['utr'] ?? null);
+            ExtensionHelper::addPayment($invoiceId, 'FamGateway', $amount, null, $transactionId);
+            Cache::forget('famgateway_order:' . $invoiceId);
+        }
     }
 
     /**
-     * Verify the webhook signature to ensure the request is authentically from FamGateway.
-     * Uses timing-safe hash_equals() to prevent timing attack vulnerabilities.
-     *
-     * @param string $rawPostData The raw POST body (file_get_contents('php://input'))
-     * @param string $signature The HTTP_X_FAMGATEWAY_SIGNATURE header
-     * @return array|false Returns the decoded JSON payload if valid, or false if invalid.
+     * NOTE: adjust this to match your Paymenter version's Invoice model if
+     * needed — this checks the invoice's `status` column for a paid value
+     * before crediting it again, so a webhook that arrives late right after
+     * the redirect fallback already ran doesn't double-add the payment.
      */
-    public function verifyWebhook($rawPostData, $signature)
+    protected function invoiceAlreadyPaid($invoiceId): bool
     {
-        if (!$rawPostData || !$signature) {
+        try {
+            $invoice = \App\Models\Invoice::find($invoiceId);
+            if (!$invoice) {
+                return false;
+            }
+            return in_array(strtolower((string) $invoice->status), ['paid', 'completed'], true);
+        } catch (\Exception $e) {
+            // If we can't determine the status, don't block crediting —
+            // Paymenter's own addPayment/invoice logic is the source of truth.
             return false;
         }
-
-        $expectedSignature = hash_hmac('sha256', $rawPostData, $this->apiKey);
-
-        if (hash_equals($expectedSignature, trim($signature))) {
-            return json_decode($rawPostData, true);
-        }
-
-        return false;
     }
 }
